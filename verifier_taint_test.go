@@ -132,39 +132,58 @@ func TestVerifyChain_LineLevelPaths(t *testing.T) {
 		{"no-hash jws verifies", string(noHash), true, 1, 0, ""},
 	}
 	for _, c := range cases {
-		report, err := v.VerifyChain(strings.NewReader(c.line + "\n"))
-		if err != nil {
-			t.Fatalf("%s: VerifyChain error: %v", c.name, err)
-		}
-		if report.Valid != c.valid {
-			t.Errorf("%s: Valid = %v, want %v (errors %v)", c.name, report.Valid, c.valid, report.Errors)
-		}
-		if report.ReceiptCount != c.receipts {
-			t.Errorf("%s: ReceiptCount = %d, want %d", c.name, report.ReceiptCount, c.receipts)
-		}
-		if report.SignatureFailures != c.sigFail {
-			t.Errorf("%s: SignatureFailures = %d, want %d", c.name, report.SignatureFailures, c.sigFail)
-		}
-		if c.errContains != "" {
-			found := false
-			for _, e := range report.Errors {
-				if strings.Contains(e, c.errContains) {
-					found = true
-				}
-			}
-			if !found {
-				t.Errorf("%s: no error containing %q in %v", c.name, c.errContains, report.Errors)
-			}
-		}
+		report := runLineCase(t, v, c.line)
+		assertLineCase(t, c, report)
 	}
 
 	// Tampered case also records the tampered receipt hash.
-	report, err := v.VerifyChain(strings.NewReader(string(tampered) + "\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	report := runLineCase(t, v, string(tampered))
 	if len(report.TamperedReceipts) == 0 {
 		t.Error("TamperedReceipts should be populated")
+	}
+}
+
+type lineCase struct {
+	name        string
+	line        string
+	valid       bool
+	receipts    int
+	sigFail     int
+	errContains string
+}
+
+// runLineCase feeds one JSONL line to VerifyChain, failing the test on error.
+func runLineCase(t *testing.T, v *Verifier, line string) *VerificationReport {
+	t.Helper()
+	report, err := v.VerifyChain(strings.NewReader(line + "\n"))
+	if err != nil {
+		t.Fatalf("VerifyChain error: %v", err)
+	}
+	return report
+}
+
+// assertLineCase checks a line case's report against its expectations.
+func assertLineCase(t *testing.T, c lineCase, report *VerificationReport) {
+	t.Helper()
+	if report.Valid != c.valid {
+		t.Errorf("%s: Valid = %v, want %v (errors %v)", c.name, report.Valid, c.valid, report.Errors)
+	}
+	if report.ReceiptCount != c.receipts {
+		t.Errorf("%s: ReceiptCount = %d, want %d", c.name, report.ReceiptCount, c.receipts)
+	}
+	if report.SignatureFailures != c.sigFail {
+		t.Errorf("%s: SignatureFailures = %d, want %d", c.name, report.SignatureFailures, c.sigFail)
+	}
+	if c.errContains != "" {
+		found := false
+		for _, e := range report.Errors {
+			if strings.Contains(e, c.errContains) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: no error containing %q in %v", c.name, c.errContains, report.Errors)
+		}
 	}
 }
 
