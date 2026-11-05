@@ -17,7 +17,11 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
       - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      # Coverage profile: coverage.out. Note: the Sonar check on this repo is
+      # SonarCloud Automatic Analysis, which does not support coverage import;
+      # passing sonar.go.coverage.reportPaths will take effect once the
+      # project switches to CI-based analysis (sonar.yml + SONAR_TOKEN secret).
       - name: gofmt
         run: |
           out=$(gofmt -l .)
