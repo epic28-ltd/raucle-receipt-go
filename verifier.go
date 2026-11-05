@@ -60,41 +60,7 @@ func (v *Verifier) VerifyChain(r io.Reader) (*VerificationReport, error) {
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			report.appendErr(report, fmt.Sprintf("line %d: invalid JSON: %v", lineNo, err))
-			continue
-		}
-		jws, ok := raw["jws"].(string)
-		if !ok {
-			report.appendErr(report, fmt.Sprintf("line %d: record has no string 'jws' field", lineNo))
-			continue
-		}
-		receipt, err := FromJWS(jws)
-		if err != nil {
-			report.appendErr(report, fmt.Sprintf("line %d: malformed receipt: %v", lineNo, err))
-			continue
-		}
-		// Tampering check
-		if stored, ok := raw["receipt_hash"].(string); ok && stored != receipt.ReceiptHash {
-			report.TamperedReceipts = append(report.TamperedReceipts, receipt.ReceiptHash)
-			report.appendErr(report, fmt.Sprintf("line %d: receipt_hash mismatch — record tampered", lineNo))
-		}
-		if stored, ok := raw["receipt_hash"].(string); ok {
-			storedHash[jws] = stored
-		}
-		// Signature
-		if !v.VerifySignature(receipt) {
-			report.SignatureFailures++
-			report.appendErr(report, fmt.Sprintf("line %d: signature verification failed for agent_key_id=%s", lineNo, receipt.AgentKeyID))
-		}
-
-		byHash[receipt.ReceiptHash] = receipt
-		report.ReceiptCount++
+		v.processChainLine(report, byHash, storedHash, strings.TrimSpace(scanner.Text()), lineNo)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -112,6 +78,45 @@ func (v *Verifier) VerifyChain(r io.Reader) (*VerificationReport, error) {
 	}
 
 	return report, nil
+}
+
+// processChainLine decodes one JSONL record and updates the report and the
+// by-hash / stored-hash indexes. Blank lines are ignored.
+func (v *Verifier) processChainLine(report *VerificationReport, byHash map[string]*Receipt, storedHash map[string]string, line string, lineNo int) {
+	if line == "" {
+		return
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		report.appendErr(report, fmt.Sprintf("line %d: invalid JSON: %v", lineNo, err))
+		return
+	}
+	jws, ok := raw["jws"].(string)
+	if !ok {
+		report.appendErr(report, fmt.Sprintf("line %d: record has no string 'jws' field", lineNo))
+		return
+	}
+	receipt, err := FromJWS(jws)
+	if err != nil {
+		report.appendErr(report, fmt.Sprintf("line %d: malformed receipt: %v", lineNo, err))
+		return
+	}
+	// Tampering check
+	if stored, ok := raw["receipt_hash"].(string); ok {
+		if stored != receipt.ReceiptHash {
+			report.TamperedReceipts = append(report.TamperedReceipts, receipt.ReceiptHash)
+			report.appendErr(report, fmt.Sprintf("line %d: receipt_hash mismatch — record tampered", lineNo))
+		}
+		storedHash[jws] = stored
+	}
+	// Signature
+	if !v.VerifySignature(receipt) {
+		report.SignatureFailures++
+		report.appendErr(report, fmt.Sprintf("line %d: signature verification failed for agent_key_id=%s", lineNo, receipt.AgentKeyID))
+	}
+
+	byHash[receipt.ReceiptHash] = receipt
+	report.ReceiptCount++
 }
 
 // VerifySignature checks the Ed25519 signature on a receipt against the
@@ -134,7 +139,7 @@ func (v *Verifier) VerifySignature(receipt *Receipt) bool {
 }
 
 // Trace walks the DAG backwards from leaf to all roots, deduplicated, BFS order.
-func (v *Verifier) Trace(receiptHash string, chainPath string) ([]*Receipt, error) {
+func (v *Verifier) Trace(receiptHash, chainPath string) ([]*Receipt, error) {
 	f, err := os.Open(chainPath)
 	if err != nil {
 		return nil, err
@@ -189,8 +194,22 @@ func (v *Verifier) checkTaint(receipt *Receipt, byHash map[string]*Receipt, repo
 	if len(receipt.Parents) == 0 {
 		return
 	}
+	inherited := collectInheritedTaint(receipt.Parents, byHash)
+	mine := make(map[string]bool)
+	for _, t := range receipt.Taint {
+		mine[t] = true
+	}
+	if receipt.Operation == OpSanitisation {
+		checkSanitisationTaint(receipt, inherited, mine, report)
+	} else {
+		checkMonotonicTaint(receipt, inherited, mine, report)
+	}
+}
+
+// collectInheritedTaint unions the taint tags of all resolvable parents.
+func collectInheritedTaint(parents []string, byHash map[string]*Receipt) map[string]bool {
 	inherited := make(map[string]bool)
-	for _, p := range receipt.Parents {
+	for _, p := range parents {
 		parent, ok := byHash[p]
 		if !ok {
 			continue
@@ -199,41 +218,44 @@ func (v *Verifier) checkTaint(receipt *Receipt, byHash map[string]*Receipt, repo
 			inherited[t] = true
 		}
 	}
-	mine := make(map[string]bool)
-	for _, t := range receipt.Taint {
-		mine[t] = true
-	}
+	return inherited
+}
 
-	if receipt.Operation == OpSanitisation {
-		removed := make(map[string]bool)
-		if strings.HasPrefix(receipt.Corpus, "removed:") {
-			for _, tag := range strings.Split(strings.TrimPrefix(receipt.Corpus, "removed:"), ",") {
-				if tag != "" {
-					removed[tag] = true
-				}
+// checkSanitisationTaint enforces that a sanitisation receipt carries exactly
+// the inherited taint minus the tags removed via "removed:" corpus entries.
+func checkSanitisationTaint(receipt *Receipt, inherited map[string]bool, mine map[string]bool, report *VerificationReport) {
+	removed := make(map[string]bool)
+	if strings.HasPrefix(receipt.Corpus, "removed:") {
+		for _, tag := range strings.Split(strings.TrimPrefix(receipt.Corpus, "removed:"), ",") {
+			if tag != "" {
+				removed[tag] = true
 			}
 		}
-		expected := make(map[string]bool)
-		for t := range inherited {
-			if !removed[t] {
-				expected[t] = true
-			}
+	}
+	expected := make(map[string]bool)
+	for t := range inherited {
+		if !removed[t] {
+			expected[t] = true
 		}
-		if !setsEqual(expected, mine) {
-			report.TaintMonotonicityFailures++
-			report.appendErr(report, fmt.Sprintf("receipt %s: sanitisation taint mismatch", receipt.ReceiptHash))
+	}
+	if !setsEqual(expected, mine) {
+		report.TaintMonotonicityFailures++
+		report.appendErr(report, fmt.Sprintf("receipt %s: sanitisation taint mismatch", receipt.ReceiptHash))
+	}
+}
+
+// checkMonotonicTaint enforces that non-sanitisation operations keep every
+// inherited taint tag.
+func checkMonotonicTaint(receipt *Receipt, inherited map[string]bool, mine map[string]bool, report *VerificationReport) {
+	var missing []string
+	for t := range inherited {
+		if !mine[t] {
+			missing = append(missing, t)
 		}
-	} else {
-		var missing []string
-		for t := range inherited {
-			if !mine[t] {
-				missing = append(missing, t)
-			}
-		}
-		if len(missing) > 0 {
-			report.TaintMonotonicityFailures++
-			report.appendErr(report, fmt.Sprintf("receipt %s: taint not monotonic — dropped %v without a sanitisation step", receipt.ReceiptHash, missing))
-		}
+	}
+	if len(missing) > 0 {
+		report.TaintMonotonicityFailures++
+		report.appendErr(report, fmt.Sprintf("receipt %s: taint not monotonic — dropped %v without a sanitisation step", receipt.ReceiptHash, missing))
 	}
 }
 
