@@ -182,7 +182,7 @@ func TestReceipt_TamperedJWSFailsVerification(t *testing.T) {
 	}
 	parts := strings.Split(r.JWS, ".")
 	// Flip last char of payload segment
-	if last := parts[1][len(parts[1])-1]; last == 'A' {
+	if parts[1][len(parts[1])-1] == 'A' {
 		parts[1] = parts[1][:len(parts[1])-1] + "B"
 	} else {
 		parts[1] = parts[1][:len(parts[1])-1] + "A"
